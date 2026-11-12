@@ -28,14 +28,17 @@ concurrency:
   group: stock-analysis
   cancel-in-progress: false
 
+# 日报回写仓库需要写权限
+permissions:
+  contents: write
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
-    # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
-    environment: STOCK_LIST
+    # 自选股不写死在工作流里：由 Repository variables / Secrets 的 STOCK_LIST 提供，
+    # 用户在 GitHub Settings 里随时改；两者都未配置时脚本默认只跑 600519。
     # 添加超时限制，防止任务卡死
-    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '60') }}
     
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -76,7 +79,7 @@ jobs:
           LITELLM_CONFIG: ${{ vars.LITELLM_CONFIG || secrets.LITELLM_CONFIG }}
           LITELLM_CONFIG_YAML: ${{ vars.LITELLM_CONFIG_YAML || secrets.LITELLM_CONFIG_YAML }}
           LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
-          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL || 'deepseek/deepseek-flash' }}
           LITELLM_FALLBACK_MODELS: ${{ vars.LITELLM_FALLBACK_MODELS || secrets.LITELLM_FALLBACK_MODELS }}
           AGENT_LITELLM_MODEL: ${{ vars.AGENT_LITELLM_MODEL || secrets.AGENT_LITELLM_MODEL }}
           VISION_MODEL: ${{ vars.VISION_MODEL || secrets.VISION_MODEL }}
@@ -442,7 +445,7 @@ jobs:
           # 系统配置
           # ==========================================
           LOG_LEVEL: INFO
-          MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
+          MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '3' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
@@ -452,10 +455,14 @@ jobs:
           
         run: |
           # 解析自选股配置：
-          # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
-          # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
-          # 3. 最小默认值
-          if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
+          # 1. 仓库里的 stocks.txt（每天由空间均线数据更新：连续10天站上5日均线
+          #    或连续15天站上10日均线，两榜并集，按成交额排序，最多 50 只）
+          # 2. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
+          # 3. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
+          # 4. 最小默认值
+          if [ -f "stocks.txt" ] && [ -s "stocks.txt" ]; then
+            export STOCK_LIST="$(tr -d '[:space:]' < stocks.txt)"
+          elif [ -n "${STOCK_LIST_CONFIG:-}" ]; then
             export STOCK_LIST="$STOCK_LIST_CONFIG"
           elif [ -z "${STOCK_LIST:-}" ]; then
             export STOCK_LIST="600519"
@@ -569,6 +576,19 @@ jobs:
             reports/
             logs/
           retention-days: 30
+      
+      - name: 提交日报到仓库
+        if: always()
+        run: |
+          if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -f reports/
+            git diff --cached --quiet || git commit -m "chore: daily report $(date +%Y-%m-%d)"
+            git push
+          else
+            echo "⚠️ 无报告可提交"
+          fi
       
       - name: 显示运行结果
         if: always()
