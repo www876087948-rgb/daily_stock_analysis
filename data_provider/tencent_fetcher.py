@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -16,11 +17,29 @@ try:
 except ImportError:  # pragma: no cover - dependency is present in supported installs
     xcals = None
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, is_bse_code
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, calc_market_stats_from_quotes, normalize_stock_code, is_bse_code
 
 logger = logging.getLogger(__name__)
 
 _MAX_KLINE_BARS = 800
+
+# 市场统计（get_market_stats）批量行情参数：
+# - 每批最多 100 只（实测 100 只约 1.5 秒，腾讯无显式批次上限）；
+# - 覆盖率低于 80% 视为数据不可信，返回 None 继续降级；
+# - 连续 3 批失败直接放弃，避免单源故障拖垮整轮分析。
+_QUOTE_BATCH_SIZE = 100
+_MIN_MARKET_COVERAGE = 0.8
+_MAX_CONSECUTIVE_CHUNK_FAILURES = 3
+
+# 全市场代码清单（新浪行情中心）：单页最多 100 只，实测全市场约 5500 只。
+_SINA_LIST_ENDPOINT = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "Market_Center.getHQNodeData"
+)
+_SINA_LIST_PAGE_SIZE = 100
+_SINA_LIST_MAX_PAGES = 80
+_SINA_LIST_TIMEOUT_SECONDS = 15
+_SINA_LIST_PAGE_RETRIES = 3
 
 
 class TencentFetcher(BaseFetcher):
@@ -132,6 +151,234 @@ class TencentFetcher(BaseFetcher):
                 exc_info=True,
             )
             return None
+
+    def get_market_stats(self) -> Optional[dict]:
+        """获取市场涨跌统计（腾讯全市场行情兜底）。
+
+        东财（efinance/akshare）与 Tushare 均不可用时，由本方法接手：
+        以新浪/Baostock/Tushare 列表（不走东财）取全市场 A 股代码，分批拉取腾讯
+        行情后按 A 股涨跌停规则计算涨跌家数、涨跌停与总成交额。
+        覆盖不足或任一环节失败返回 None，由调用方继续降级。
+        """
+        codes = self._get_all_a_share_codes()
+        if not codes:
+            return None
+
+        symbols = []
+        for code in codes:
+            symbol = _to_tencent_symbol(code)
+            if symbol:
+                symbols.append(symbol)
+        if not symbols:
+            return None
+
+        rows: list[dict[str, Any]] = []
+        consecutive_failures = 0
+        for start in range(0, len(symbols), _QUOTE_BATCH_SIZE):
+            chunk = symbols[start:start + _QUOTE_BATCH_SIZE]
+            try:
+                chunk_rows = self._fetch_quote_chunk(chunk)
+            except Exception:
+                consecutive_failures += 1
+                logger.warning(
+                    "[Tencent] market stats quote chunk failed (%d/%d consecutive)",
+                    consecutive_failures,
+                    _MAX_CONSECUTIVE_CHUNK_FAILURES,
+                    exc_info=True,
+                )
+                if consecutive_failures >= _MAX_CONSECUTIVE_CHUNK_FAILURES:
+                    logger.warning("[Tencent] market stats aborted: too many chunk failures")
+                    return None
+                continue
+            consecutive_failures = 0
+            rows.extend(chunk_rows)
+
+        if not rows:
+            logger.warning("[Tencent] market stats got no quotes")
+            return None
+
+        coverage = len(rows) / len(symbols)
+        logger.info(
+            "[Tencent] market stats coverage %.1f%% (%d/%d symbols)",
+            coverage * 100,
+            len(rows),
+            len(symbols),
+        )
+        if coverage < _MIN_MARKET_COVERAGE:
+            logger.warning(
+                "[Tencent] market stats coverage %.1f%% below %.0f%% threshold; discarding",
+                coverage * 100,
+                _MIN_MARKET_COVERAGE * 100,
+            )
+            return None
+
+        df = pd.DataFrame(rows, columns=["ts_code", "name", "close", "pre_close", "amount"])
+        return calc_market_stats_from_quotes(df)
+
+    def _get_all_a_share_codes(self) -> list[str]:
+        """全市场 A 股代码清单：新浪 → Baostock → Tushare，首个非空者胜。
+
+        清单源均不走东财。Baostock SDK 在云端机房 IP 上登录经常挂起，
+        故首选新浪 HTTPS 分页接口（已实测覆盖全市场约 5500 只）。
+        """
+        for source, getter in (
+            ("Sina", self._fetch_sina_stock_codes),
+            ("Baostock", self._fetch_baostock_stock_codes),
+            ("Tushare", self._fetch_tushare_stock_codes),
+        ):
+            try:
+                codes = getter()
+            except Exception:
+                logger.warning("[Tencent] %s stock list failed; trying next source", source, exc_info=True)
+                continue
+            if codes:
+                logger.info("[Tencent] stock list from %s: %d codes", source, len(codes))
+                return codes
+            logger.info("[Tencent] %s stock list empty; trying next source", source)
+        return []
+
+    def _fetch_sina_stock_codes(self) -> list[str]:
+        """全市场 A 股代码清单（新浪行情中心，HTTPS 分页）。
+
+        每页最多重试 3 次；某页 3 次都失败才放弃本源，交给下一源，
+        避免单次网络抖动丢掉整份清单，也避免缺页导致宽度失真。
+        """
+        codes: list[str] = []
+        for page in range(1, _SINA_LIST_MAX_PAGES + 1):
+            rows = self._fetch_sina_list_page(page)
+            if rows is None:
+                logger.warning("[Tencent] Sina stock list page %d failed after retries; giving up Sina source", page)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                code = normalize_stock_code(str(row.get("code") or row.get("symbol") or ""))
+                if code and len(code) == 6 and code.isdigit():
+                    codes.append(code)
+            if len(rows) < _SINA_LIST_PAGE_SIZE:
+                break
+        return list(dict.fromkeys(codes))
+
+    def _fetch_sina_list_page(self, page: int) -> list | None:
+        """拉一页新浪清单；3 次重试都失败返回 None。"""
+        last_error: Exception | None = None
+        for _attempt in range(_SINA_LIST_PAGE_RETRIES):
+            try:
+                response = requests.get(
+                    _SINA_LIST_ENDPOINT,
+                    params={
+                        "page": page,
+                        "num": _SINA_LIST_PAGE_SIZE,
+                        "sort": "symbol",
+                        "asc": 1,
+                        "node": "hs_a",
+                        "_s_r_a": "page",
+                    },
+                    headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+                    timeout=_SINA_LIST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:  # noqa: BLE001 - transient network errors are retried
+                last_error = exc
+        logger.warning(
+            "[Tencent] Sina stock list page %d failed after %d attempts",
+            page,
+            _SINA_LIST_PAGE_RETRIES,
+            exc_info=last_error,
+        )
+        return None
+
+    def _fetch_baostock_stock_codes(self) -> list[str]:
+        """全市场 A 股代码清单（Baostock，不走东财）。延迟导入，未安装时返回空清单。"""
+        try:
+            from .baostock_fetcher import BaostockFetcher
+        except Exception:
+            logger.warning("[Tencent] BaostockFetcher unavailable; market stats skipped", exc_info=True)
+            return []
+        try:
+            df = BaostockFetcher().get_stock_list()
+        except Exception:
+            logger.warning("[Tencent] Baostock stock list failed; market stats skipped", exc_info=True)
+            return []
+        if df is None or df.empty or "code" not in df.columns:
+            return []
+        codes: list[str] = []
+        for raw in df["code"].astype(str):
+            code = normalize_stock_code(raw)
+            if code and len(code) == 6 and code.isdigit():
+                codes.append(code)
+        return list(dict.fromkeys(codes))
+
+    @staticmethod
+    def _fetch_tushare_stock_codes() -> list[str]:
+        """全市场 A 股代码清单（Tushare stock_basic，需配置 Token；未配置时返回空清单）。"""
+        try:
+            from .tushare_fetcher import TushareFetcher
+        except Exception:
+            return []
+        try:
+            df = TushareFetcher().get_stock_list()
+        except Exception:
+            logger.warning("[Tencent] Tushare stock list failed", exc_info=True)
+            return []
+        if df is None or df.empty or "code" not in df.columns:
+            return []
+        codes: list[str] = []
+        for raw in df["code"].astype(str):
+            code = normalize_stock_code(raw)
+            if code and len(code) == 6 and code.isdigit():
+                codes.append(code)
+        return list(dict.fromkeys(codes))
+
+    def _fetch_quote_chunk(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """批量拉取一组腾讯行情并解析为统计行。"""
+        url = f"{self._QUOTE_ENDPOINT}={','.join(symbols)}"
+        response = requests.get(
+            url,
+            headers={"Referer": "https://finance.qq.com", "User-Agent": "Mozilla/5.0"},
+            timeout=self._HTTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        response.encoding = "gbk"
+        rows: list[dict[str, Any]] = []
+        for match in _QUOTE_LINE_RE.finditer(response.text or ""):
+            row = _parse_quote_fields(match.group(1).split("~"))
+            if row is not None:
+                rows.append(row)
+        return rows
+
+
+_QUOTE_LINE_RE = re.compile(r'v_(?:sh|sz|bj)\d+="([^"]*)";')
+
+
+def _parse_quote_fields(fields: list[str]) -> Optional[dict[str, Any]]:
+    """解析一行腾讯行情为统计行。
+
+    字段：1 名称、2 代码、3 现价、4 昨收、37 成交额（万元）。
+    成交额统一折算为元，与其他数据源的口径一致。
+    """
+    if len(fields) <= 37:
+        return None
+    code = (fields[2] or "").strip()
+    name = (fields[1] or "").strip()
+    try:
+        close = float(fields[3])
+        pre_close = float(fields[4])
+        amount_wan = float(fields[37])
+    except (TypeError, ValueError):
+        return None
+    if not code or not name:
+        return None
+    return {
+        "ts_code": code,
+        "name": name,
+        "close": close,
+        "pre_close": pre_close,
+        "amount": amount_wan * 10000.0,
+    }
 
 
 def _to_tencent_symbol(stock_code: str) -> str:
