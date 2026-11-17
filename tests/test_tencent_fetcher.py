@@ -10,12 +10,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 from requests import Response
 
+from data_provider.base import calc_market_stats_from_quotes
 from data_provider.tencent_fetcher import (
     TencentFetcher,
     _is_star_market,
     _lots_to_shares,
+    _parse_quote_fields,
     _to_tencent_symbol,
 )
 
@@ -499,3 +502,288 @@ def test_tencent_fetcher_does_not_multiply_star_market_volume() -> None:
     # volume * close / amount should be ~1 when units are consistent.
     ratio = float(df.iloc[1]["volume"]) * float(df.iloc[1]["close"]) / float(df.iloc[1]["amount"])
     assert 0.99 < ratio < 1.01
+
+
+def _quote_line(symbol: str, name: str, code: str, price: str, prev_close: str, amount_wan: str) -> str:
+    """Build one real-format Tencent quote line (fields: 1 name, 2 code, 3 price, 4 prev close, 37 amount in 万元)."""
+    fields = [""] * 50
+    fields[1] = name
+    fields[2] = code
+    fields[3] = price
+    fields[4] = prev_close
+    fields[37] = amount_wan
+    return 'v_' + symbol + '="' + "~".join(fields) + '";'
+
+
+class _FakeQuoteResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _FakeHttpResponse:
+    """Fake requests response carrying either quote text or a JSON payload."""
+
+    def __init__(self, text: str = "", json_data=None) -> None:
+        self.text = text
+        self._json_data = json_data
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self._json_data
+
+
+def test_parse_quote_fields_maps_tencent_columns() -> None:
+    line = _quote_line("sz000001", "平安银行", "000001", "12.25", "12.30", "192478")
+    row = _parse_quote_fields(line.split('"')[1].split("~"))
+
+    assert row == {
+        "ts_code": "000001",
+        "name": "平安银行",
+        "close": 12.25,
+        "pre_close": 12.30,
+        "amount": 1924780000.0,
+    }
+    assert _parse_quote_fields(["a", "b"]) is None
+    bad_price = _quote_line("sz000001", "平安银行", "000001", "-", "12.30", "192478")
+    assert _parse_quote_fields(bad_price.split('"')[1].split("~")) is None
+
+
+def test_calc_market_stats_from_quotes_applies_a_share_limit_rules() -> None:
+    df = pd.DataFrame(
+        [
+            {"ts_code": "000001", "name": "平安银行", "close": 13.53, "pre_close": 12.30, "amount": 100000 * 10000.0},
+            {"ts_code": "600000", "name": "浦发银行", "close": 10.78, "pre_close": 10.78, "amount": 50000 * 10000.0},
+            {"ts_code": "688001", "name": "华兴源创", "close": 30.00, "pre_close": 33.42, "amount": 80000 * 10000.0},
+            {"ts_code": "000002", "name": "*STxxx", "close": 5.00, "pre_close": 5.26, "amount": 10000 * 10000.0},
+            {"ts_code": "300001", "name": "特锐德", "close": 22.00, "pre_close": 20.00, "amount": 20000 * 10000.0},
+            {"ts_code": "600001", "name": "停牌股", "close": 10.00, "pre_close": 10.00, "amount": 0.0},
+        ]
+    )
+
+    stats = calc_market_stats_from_quotes(df)
+
+    assert stats is not None
+    assert stats["up_count"] == 2
+    assert stats["down_count"] == 2
+    assert stats["flat_count"] == 1
+    assert stats["limit_up_count"] == 1
+    assert stats["limit_down_count"] == 1
+    assert stats["total_amount"] == pytest.approx(26.0)
+
+
+def test_get_market_stats_uses_sina_list_and_tencent_quotes() -> None:
+    sina_rows = [
+        {"symbol": "sz000001", "code": "000001", "name": "平安银行"},
+        {"symbol": "sh600000", "code": "600000", "name": "浦发银行"},
+        {"symbol": "sh688001", "code": "688001", "name": "华兴源创"},
+        {"symbol": "sz000002", "code": "000002", "name": "*STxxx"},
+        {"symbol": "sz300001", "code": "300001", "name": "特锐德"},
+    ]
+    text = "\n".join(
+        [
+            _quote_line("sz000001", "平安银行", "000001", "13.53", "12.30", "100000"),
+            _quote_line("sh600000", "浦发银行", "600000", "10.78", "10.78", "50000"),
+            _quote_line("sh688001", "华兴源创", "688001", "30.00", "33.42", "80000"),
+            _quote_line("sz000002", "*STxxx", "000002", "5.00", "5.26", "10000"),
+            _quote_line("sz300001", "特锐德", "300001", "22.00", "20.00", "20000"),
+        ]
+    )
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        if "sina" in url:
+            captured["sina_called"] = True
+            return _FakeHttpResponse(json_data=sina_rows)
+        return _FakeQuoteResponse(text)
+
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        stats = TencentFetcher().get_market_stats()
+
+    assert stats is not None
+    assert stats["up_count"] == 2
+    assert stats["down_count"] == 2
+    assert stats["flat_count"] == 1
+    assert stats["limit_up_count"] == 1
+    assert stats["limit_down_count"] == 1
+    assert stats["total_amount"] == pytest.approx(26.0)
+    assert captured["sina_called"] is True
+    assert captured["url"].startswith("https://qt.gtimg.cn/q=")
+    for symbol in ("sz000001", "sh600000", "sh688001", "sz000002", "sz300001"):
+        assert symbol in captured["url"]
+
+
+def test_get_market_stats_falls_back_to_baostock_when_sina_fails() -> None:
+    codes = pd.DataFrame(
+        {
+            "code": ["000001", "600000", "688001", "000002", "300001"],
+            "name": ["平安银行", "浦发银行", "华兴源创", "*STxxx", "特锐德"],
+        }
+    )
+    text = "\n".join(
+        [
+            _quote_line("sz000001", "平安银行", "000001", "13.53", "12.30", "100000"),
+            _quote_line("sh600000", "浦发银行", "600000", "10.78", "10.78", "50000"),
+            _quote_line("sh688001", "华兴源创", "688001", "30.00", "33.42", "80000"),
+            _quote_line("sz000002", "*STxxx", "000002", "5.00", "5.26", "10000"),
+            _quote_line("sz300001", "特锐德", "300001", "22.00", "20.00", "20000"),
+        ]
+    )
+
+    def fake_get(url, **kwargs):
+        if "sina" in url:
+            raise Exception("sina down")
+        return _FakeQuoteResponse(text)
+
+    with (
+        patch("data_provider.baostock_fetcher.BaostockFetcher.get_stock_list", return_value=codes),
+        patch("data_provider.tencent_fetcher.requests.get", fake_get),
+    ):
+        stats = TencentFetcher().get_market_stats()
+
+    assert stats is not None
+    assert stats["up_count"] == 2
+    assert stats["total_amount"] == pytest.approx(26.0)
+
+
+def test_get_market_stats_returns_none_when_all_stock_lists_fail() -> None:
+    def failing_get(url, **kwargs):
+        raise Exception("network down")
+
+    with (
+        patch("data_provider.baostock_fetcher.BaostockFetcher.get_stock_list", return_value=None),
+        patch("data_provider.tushare_fetcher.TushareFetcher.get_stock_list", return_value=None),
+        patch("data_provider.tencent_fetcher.requests.get", failing_get),
+    ):
+        assert TencentFetcher().get_market_stats() is None
+
+
+def test_fetch_sina_stock_codes_paginates_and_dedupes() -> None:
+    def fake_get(url, **kwargs):
+        page = kwargs["params"]["page"]
+        assert kwargs["params"]["num"] == 100
+        assert kwargs["params"]["node"] == "hs_a"
+        if page == 1:
+            rows = [{"symbol": f"sh600{i:03d}", "code": f"600{i:03d}", "name": "x"} for i in range(100)]
+        elif page == 2:
+            rows = [{"symbol": f"sz{i:06d}", "code": f"{i:06d}", "name": "x"} for i in range(1, 101)]
+        else:
+            rows = [
+                {"symbol": "sh600000", "code": "600000", "name": "x"},
+                {"symbol": "bj920000", "code": "920000", "name": "x"},
+            ]
+        return _FakeHttpResponse(json_data=rows)
+
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        codes = TencentFetcher()._fetch_sina_stock_codes()
+
+    assert len(codes) == 201
+    assert codes.count("600000") == 1
+    assert "920000" in codes
+
+
+def test_fetch_sina_stock_codes_aborts_on_page_failure() -> None:
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs["params"]["page"])
+        if kwargs["params"]["page"] == 2:
+            raise Exception("page 2 down")
+        return _FakeHttpResponse(
+            json_data=[{"symbol": f"sh600{i:03d}", "code": f"600{i:03d}", "name": "x"} for i in range(100)]
+        )
+
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        assert TencentFetcher()._fetch_sina_stock_codes() == []
+
+    assert calls == [1, 2, 2, 2]
+
+
+def test_fetch_sina_stock_codes_retries_transient_page_failure() -> None:
+    attempts = []
+
+    def fake_get(url, **kwargs):
+        page = kwargs["params"]["page"]
+        attempts.append(page)
+        if page == 2 and attempts.count(2) < 3:
+            raise Exception("page 2 flaky")
+        if page == 1:
+            rows = [{"symbol": f"sh600{i:03d}", "code": f"600{i:03d}", "name": "x"} for i in range(100)]
+        else:
+            rows = [{"symbol": "bj920000", "code": "920000", "name": "x"}]
+        return _FakeHttpResponse(json_data=rows)
+
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        codes = TencentFetcher()._fetch_sina_stock_codes()
+
+    assert len(codes) == 101
+    assert "920000" in codes
+    assert attempts.count(2) == 3
+
+
+def test_get_market_stats_returns_none_when_coverage_below_threshold() -> None:
+    codes = pd.DataFrame({"code": [f"{i:06d}" for i in range(1, 11)], "name": ["x"] * 10})
+    text = "\n".join(
+        _quote_line(f"sz{i:06d}", "x", f"{i:06d}", "10.00", "10.00", "1000") for i in range(1, 6)
+    )
+
+    def fake_get(url, **kwargs):
+        if "sina" in url:
+            raise Exception("sina down")
+        return _FakeQuoteResponse(text)
+
+    with (
+        patch("data_provider.baostock_fetcher.BaostockFetcher.get_stock_list", return_value=codes),
+        patch("data_provider.tencent_fetcher.requests.get", fake_get),
+    ):
+        assert TencentFetcher().get_market_stats() is None
+
+
+def test_get_market_stats_chunks_large_symbol_lists() -> None:
+    codes = pd.DataFrame({"code": [f"600{i:03d}" for i in range(250)], "name": ["x"] * 250})
+    calls = []
+
+    def fake_get(url, **kwargs):
+        if "sina" in url:
+            raise Exception("sina down")
+        calls.append(url)
+        symbols = url.split("q=", 1)[1].split(",")
+        text = "\n".join(_quote_line(s, "x", s[2:], "10.00", "10.00", "1000") for s in symbols)
+        return _FakeQuoteResponse(text)
+
+    with (
+        patch("data_provider.baostock_fetcher.BaostockFetcher.get_stock_list", return_value=codes),
+        patch("data_provider.tencent_fetcher.requests.get", fake_get),
+    ):
+        stats = TencentFetcher().get_market_stats()
+
+    assert len(calls) == 3
+    assert stats is not None
+    assert stats["flat_count"] == 250
+    assert stats["total_amount"] == pytest.approx(25.0)
+
+
+def test_get_market_stats_aborts_after_repeated_chunk_failures() -> None:
+    codes = pd.DataFrame({"code": [f"600{i:03d}" for i in range(250)], "name": ["x"] * 250})
+    calls = []
+
+    def failing_get(url, **kwargs):
+        if "sina" in url:
+            raise Exception("sina down")
+        calls.append(url)
+        raise Exception("boom")
+
+    with (
+        patch("data_provider.baostock_fetcher.BaostockFetcher.get_stock_list", return_value=codes),
+        patch("data_provider.tencent_fetcher.requests.get", failing_get),
+    ):
+        assert TencentFetcher().get_market_stats() is None
+
+    assert len(calls) == 3
