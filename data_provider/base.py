@@ -255,6 +255,28 @@ def _market_tag(code: str) -> str:
     return "cn"
 
 
+def _hithink_bundle_has_content(payload: Any) -> bool:
+    """True when a Hithink fundamental bundle carries usable core fields.
+
+    The manager only prefers the Hithink bundle over AkShare when it has
+    meaningful growth values or a financial report with real numbers;
+    an empty/failed bundle must fall through to AkShare unchanged.
+    """
+    if not isinstance(payload, dict):
+        return False
+    growth = payload.get("growth")
+    if isinstance(growth, dict) and any(v is not None for v in growth.values()):
+        return True
+    earnings = payload.get("earnings")
+    if isinstance(earnings, dict):
+        report = earnings.get("financial_report")
+        if isinstance(report, dict) and any(
+            v is not None for k, v in report.items() if k != "report_date"
+        ):
+            return True
+    return False
+
+
 _US_EXCHANGE_SUFFIXES = (".US", ".N", ".O")  # _market_tag 目前不识别的美股交易所后缀
 
 
@@ -801,6 +823,11 @@ class DataFetcherManager:
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
+        self._hithink_fetcher = None
+        self._hithink_api_key: Optional[str] = None
+        self._hithink_lock = RLock()
+        self._hithink_fundamental_adapter = None
+        self._hithink_fundamental_api_key: Optional[str] = None
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
@@ -1629,6 +1656,75 @@ class DataFetcherManager:
                 self._tickflow_api_key = None
                 return None
 
+    def _get_hithink_fetcher(self):
+        """Lazily create a Hithink fetcher for market-review-only calls.
+
+        Reuses the registered HithinkFetcher instance when the key is
+        configured (same pattern as TickFlow); otherwise builds a fresh
+        one from config so market stats keep working even if the fetcher
+        list was constructed without it.
+        """
+        from src.config import get_config
+
+        config = get_config()
+        api_key = (getattr(config, "hithink_finance_api_key", None) or "").strip()
+
+        if not hasattr(self, "_hithink_lock") or self._hithink_lock is None:
+            self._hithink_lock = RLock()
+
+        with self._hithink_lock:
+            if not api_key:
+                self._hithink_fetcher = None
+                self._hithink_api_key = None
+                return None
+
+            configured_fetcher = self._get_fetcher_by_name("HithinkFetcher")
+            if configured_fetcher is not None:
+                return configured_fetcher
+
+            current_fetcher = getattr(self, "_hithink_fetcher", None)
+            current_key = getattr(self, "_hithink_api_key", None)
+            if current_fetcher is not None and current_key == api_key:
+                return current_fetcher
+
+            try:
+                from .hithink_fetcher import HithinkFetcher
+
+                fetcher = HithinkFetcher(
+                    api_key=api_key,
+                    priority=getattr(config, "hithink_priority", 6),
+                )
+                self._hithink_fetcher = fetcher
+                self._hithink_api_key = api_key
+                return fetcher
+            except Exception as exc:
+                logger.warning("[HithinkFetcher] 初始化失败: %s", exc)
+                self._hithink_fetcher = None
+                self._hithink_api_key = None
+                return None
+
+    def _get_hithink_fundamental_adapter(self):
+        """Lazily create the Hithink fundamental adapter when configured."""
+        from src.config import get_config
+
+        config = get_config()
+        api_key = (getattr(config, "hithink_finance_api_key", None) or "").strip()
+        if not api_key:
+            return None
+        current = getattr(self, "_hithink_fundamental_adapter", None)
+        if current is not None and getattr(self, "_hithink_fundamental_api_key", None) == api_key:
+            return current
+        try:
+            from .hithink_fundamental_adapter import HithinkFundamentalAdapter
+
+            adapter = HithinkFundamentalAdapter(api_key=api_key)
+            self._hithink_fundamental_adapter = adapter
+            self._hithink_fundamental_api_key = api_key
+            return adapter
+        except Exception as exc:
+            logger.warning("[Hithink] fundamental adapter 初始化失败: %s", exc)
+            return None
+
     def close(self) -> None:
         """Best-effort release of manager-owned resources."""
         if not hasattr(self, "_tickflow_lock") or self._tickflow_lock is None:
@@ -1902,6 +1998,8 @@ class DataFetcherManager:
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
           5. TencentFetcher (Priority 5) - A 股最终兜底
+          6. HithinkFetcher (Priority 6) - 市场宽度与财报主源（需
+             HITHINK_FINANCE_API_KEY；日 K 不走本源，通用链路末位）
         """
         from src.config import get_config
         from .efinance_fetcher import EfinanceFetcher
@@ -1909,6 +2007,7 @@ class DataFetcherManager:
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
         from .tickflow_fetcher import TickFlowFetcher
+        from .hithink_fetcher import HithinkFetcher
         from .pytdx_fetcher import PytdxFetcher
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
@@ -1929,6 +2028,17 @@ class DataFetcherManager:
             optional_fetchers.append(TushareFetcher())  # 会根据 Token 配置自动调整优先级
         else:
             logger.debug("[数据源初始化] 跳过未配置的 TushareFetcher")
+
+        hithink_api_key = (getattr(config, "hithink_finance_api_key", None) or "").strip()
+        if hithink_api_key:
+            optional_fetchers.append(
+                HithinkFetcher(
+                    api_key=hithink_api_key,
+                    priority=getattr(config, "hithink_priority", 6),
+                )
+            )
+        else:
+            logger.debug("[数据源初始化] 跳过未配置的 HithinkFetcher")
 
         tickflow_api_key = (getattr(config, "tickflow_api_key", None) or "").strip()
         if tickflow_api_key:
@@ -3441,6 +3551,36 @@ class DataFetcherManager:
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
+        hithink_fetcher = self._get_hithink_fetcher()
+        if hithink_fetcher is not None:
+            started_at = time.monotonic()
+            try:
+                data = hithink_fetcher.get_market_stats()
+                elapsed = time.monotonic() - started_at
+                if data:
+                    logger.info(
+                        "[MarketStats] component=market_stats action=provider_success "
+                        "purpose=%s provider=HithinkFetcher elapsed=%.2fs",
+                        purpose,
+                        elapsed,
+                    )
+                    return data
+                logger.info(
+                    "[MarketStats] component=market_stats action=provider_empty "
+                    "purpose=%s provider=HithinkFetcher elapsed=%.2fs",
+                    purpose,
+                    elapsed,
+                )
+            except Exception as e:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    "[MarketStats] component=market_stats action=provider_failed "
+                    "purpose=%s provider=HithinkFetcher elapsed=%.2fs error=%s",
+                    purpose,
+                    elapsed,
+                    e,
+                )
+
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:
             started_at = time.monotonic()
@@ -4493,8 +4633,28 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
-        if remaining_seconds <= 0:
+        # growth / earnings / institution (Hithink first, AkShare fallback).
+        # The Hithink attempt is capped at 20s so a slow primary cannot
+        # starve the AkShare fallback out of the remaining stage budget.
+        hithink_bundle_payload: Dict[str, Any] = {}
+        hithink_bundle_err: Optional[str] = None
+        hithink_bundle_ms = 0
+        hithink_adapter = self._get_hithink_fundamental_adapter()
+        if hithink_adapter is not None and remaining_seconds > 0:
+            hithink_timeout = min(fetch_timeout, remaining_seconds, 20.0)
+            hithink_bundle_payload, hithink_bundle_err, hithink_bundle_ms = self._run_with_retry(
+                lambda: hithink_adapter.get_fundamental_bundle(stock_code),
+                hithink_timeout,
+                "fundamental_bundle_hithink",
+                quarantine_key=("hithink", "fundamental_bundle"),
+            )
+            _consume_budget(hithink_bundle_ms)
+        if _hithink_bundle_has_content(hithink_bundle_payload):
+            bundle_payload = hithink_bundle_payload
+            bundle_ms = hithink_bundle_ms
+            bundle_status = str(hithink_bundle_payload.get("status", "not_supported"))
+            bundle_errors = [hithink_bundle_err] if hithink_bundle_err else []
+        elif remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
             bundle_errors = ["fundamental stage timeout"]
