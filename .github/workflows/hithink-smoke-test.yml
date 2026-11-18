@@ -9,7 +9,7 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -64,6 +64,37 @@ jobs:
           with open("hithink-smoke-result.json", "w", encoding="utf-8") as f:
               json.dump(results, f, ensure_ascii=False, indent=2)
           raise SystemExit(0 if all_ok else 1)
+          PYEOF
+      - name: Install dependencies for live integration check
+        run: pip install -q -r requirements.txt
+      - name: Live integration check (fetcher + adapter)
+        env:
+          HITHINK_FINANCE_API_KEY: ${{ secrets.HITHINK_FINANCE_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          from data_provider.hithink_fetcher import HithinkFetcher
+          from data_provider.hithink_fundamental_adapter import HithinkFundamentalAdapter
+
+          fetcher = HithinkFetcher()
+          stats = fetcher.get_market_stats()
+          print("MARKET_STATS:", stats)
+          assert stats, "market stats empty"
+          total = stats["up_count"] + stats["down_count"] + stats["flat_count"]
+          assert total > 1000, f"breadth looks empty: {total}"
+          assert stats["total_amount"] > 0, "total amount missing"
+          print(f"BREADTH OK: up={stats['up_count']} down={stats['down_count']} flat={stats['flat_count']} limit_up={stats['limit_up_count']} total_amount={stats['total_amount']:.1f}亿")
+
+          adapter = HithinkFundamentalAdapter()
+          bundle = adapter.get_fundamental_bundle("600519")
+          print("BUNDLE_STATUS:", bundle.get("status"))
+          print("GROWTH:", bundle.get("growth"))
+          print("FINANCIAL_REPORT:", (bundle.get("earnings") or {}).get("financial_report"))
+          print("DIVIDEND:", (bundle.get("earnings") or {}).get("dividend"))
+          assert bundle.get("status") == "partial", "bundle not partial"
+          report = (bundle.get("earnings") or {}).get("financial_report") or {}
+          assert report.get("revenue"), "revenue missing"
+          assert report.get("net_profit_parent"), "net profit missing"
+          print("LIVE_INTEGRATION: PASS")
           PYEOF
       - name: Upload result
         if: always()
