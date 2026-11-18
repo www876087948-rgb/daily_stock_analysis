@@ -65,6 +65,10 @@ jobs:
               json.dump(results, f, ensure_ascii=False, indent=2)
           raise SystemExit(0 if all_ok else 1)
           PYEOF
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Install dependencies for live integration check
         run: pip install -q -r requirements.txt
       - name: Live integration check (fetcher + adapter)
