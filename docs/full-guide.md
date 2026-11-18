@@ -169,6 +169,7 @@ daily_stock_analysis/
 | `SEARXNG_TIMEOUT_SECONDS` | 自建 SearXNG 单次搜索超时（秒，默认 `10`，最小 `1`）；实例较慢（如聚合引擎较多的 NAS 部署）时可调大，公共实例超时不受影响。GitHub Actions 需显式映射该变量 | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
 | `TUSHARE_HTTP_URL` | Tushare Pro HTTP 接入地址；留空（或未设置/空白）时使用官方端点 `http://api.tushare.pro`，仅在需通过公司内网代理、跨境网络或自建镜像时填写 `http://` 或 `https://` 开头的完整地址 | 可选 |
+| `HITHINK_FINANCE_API_KEY` | [同花顺 Financial-API](https://fuyao.aicubes.cn/admin/) Key；可选，配置后市场宽度统计与个股财报结构化字段优先走同花顺官方接口，东财/Tushare/腾讯留作兜底。 | 可选 |
 | `TICKFLOW_API_KEY` | [TickFlow](https://tickflow.org) API Key；可选，用于 A 股日 K、实时行情、股票列表/名称与大盘复盘增强；失败或权限不足时自动回退。 | 可选 |
 | `MX_APIKEY` / `MX_PRIORITY` | 妙想（东方财富 MX_API）补充数据源：在东财公开接口失败/限流时兜底获取筹码分布与个股资金流。**严格 opt-in 的第三方能力**：需用户自备 Key（妙想 Skills 页面），限时免费/会员配额策略可能调整、不承诺长期免费；未配置则不启用、行为不变。`MX_PRIORITY` 默认 `6`。GitHub Actions 需在 Secrets 配置 `MX_APIKEY` | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | [Longbridge OpenAPI](https://open.longbridge.com/) OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | 可选 |
@@ -436,6 +437,8 @@ daily_stock_analysis/
 | `TICKFLOW_API_KEY` | TickFlow API Key；可选，用于 A 股日 K、实时行情、股票列表/名称与大盘复盘增强；失败或权限不足时自动回退。 | - | 可选 |
 | `TICKFLOW_PRIORITY` | TickFlow 普通 A 股日 K 数据源优先级；数字越小越早尝试，默认 `2`；未配置 API Key 时不启用；已登记指数使用独立固定链，不读取本变量；不影响实时行情。 | `2` | 可选 |
 | `TENCENT_PRIORITY` | 腾讯直连普通 A 股日 K 数据源优先级；数字越小越早尝试，默认 `5`，作为通用链路最终兜底；已登记指数使用独立固定链，不读取本变量；不影响实时行情。 | `5` | 可选 |
+| `HITHINK_FINANCE_API_KEY` | 同花顺 Financial-API Key；可选，配置后市场宽度统计与个股财报结构化字段优先走同花顺官方接口，失败或字段缺失时回落到既有链路；未配置时行为不变。 | - | 可选 |
+| `HITHINK_PRIORITY` | 同花顺通用数据源优先级；数字越小越早尝试，默认 `6`；仅影响通用回退链（日 K 不走同花顺），市场宽度与财报另有显式优先逻辑。 | `6` | 可选 |
 | `TICKFLOW_KLINE_ADJUST` | TickFlow 日 K 复权模式：`none`、`forward`、`backward`、`forward_additive`、`backward_additive`。 | `none` | 可选 |
 | `TICKFLOW_BATCH_DAILY_ENABLED` | 是否启用 TickFlow 批量日 K 预取；权限不足会短期缓存失败状态，并继续走常规回退。 | `true` | 可选 |
 | `TICKFLOW_BATCH_SIZE` | TickFlow 日 K 与实时行情批量请求的单批最大标的数。 | `100` | 可选 |
@@ -472,7 +475,8 @@ daily_stock_analysis/
 > - TickFlow 日 K 区间请求会显式传入 `start_time` / `end_time` / `count`；官方 quickstart 明确说明时间范围查询仍受 `count` 限制。若返回非空但行数打满 `count` 且首个返回交易日晚于请求起始交易日，系统会判定为疑似截断，不写入缓存并让 manager 继续回退。
 > - 批量分析时，`prefetch_daily_klines()` 会在逐股 `get_daily_data()` 之前预热进程内缓存，不改变对外调用路径。
 > - TickFlow 能力按套餐权限分层：有限权限套餐仍可使用主指数查询；支持 `CN_Equity_A` 标的池查询的套餐才会启用 TickFlow 市场统计。
-> - 市场宽度统计（涨跌家数/涨跌停/总成交额）的回退链为 TickFlow → Efinance → AkShare → Tushare（需配置 `TUSHARE_TOKEN`）→ Tencent：东财与 Tushare 均不可用时，Tencent 以新浪行情中心全市场代码清单（Baostock/Tushare 兜底，不走东财）分批拉取腾讯行情计算；覆盖率低于 80% 或连续 3 批失败时返回空结果继续降级，不拖垮整轮分析。概念/板块排行与筹码分布不在腾讯覆盖内。
+> - 市场宽度统计（涨跌家数/涨跌停/总成交额）的回退链为 Hithink（需配置 `HITHINK_FINANCE_API_KEY`）→ TickFlow → Efinance → AkShare → Tushare（需配置 `TUSHARE_TOKEN`）→ Tencent：同花顺以官方快照分页（每页 1000 只）加官方涨停统计计算，涨停数以官方统计为准；覆盖率低于 80% 或连续 3 页失败时返回空结果继续降级，不拖垮整轮分析。东财与 Tushare 均不可用时，Tencent 以新浪行情中心全市场代码清单（Baostock/Tushare 兜底，不走东财）分批拉取腾讯行情计算。概念/板块排行与筹码分布不在同花顺/腾讯覆盖内。
+> - 配置 `HITHINK_FINANCE_API_KEY` 后，个股财报结构化字段（营收/归母净利润/基本每股收益/经营现金流、营收与净利润同比、ROE、毛利率、TTM 现金分红）优先走同花顺官方接口（利润表/现金流量表/财务指标/复权因子），单只尝试上限 20 秒；无有效财报内容时回落到 AkShare 财报 bundle。估值（PE/PB）仍走实时行情；筹码分布同花顺官方接口不提供，仍走现有链路。
 > - TickFlow 可通过申万一级行业标的池与全 A 股行情生成行业涨跌排行，并优先参与市场结构行业主线 fallback；概念题材排行仍由现有 AkShare / Tushare / Efinance 链路提供。
 > - TickFlow 官方 quickstart 提供了 `quotes.get(universes=["CN_Equity_A"])` 用法，但不同 API Key 不一定拥有对应权限；批量日 K、深度和财务等能力也按权限 fail-open。
 > - TickFlow 实际返回的 `change_pct` / `amplitude` 为比例值；系统已在接入层统一转换为百分比值，确保与现有数据源字段语义一致。
@@ -882,10 +886,6 @@ schedule:
 2. 选择 `mode`（`full` / `market-only` / `stocks-only`）
 3. 若当天是非交易日且希望仍执行，将 `force_run` 设为 `true`
 4. 点击 `Run workflow`
-
-#### Top2 评分手动运行
-
-`.github/workflows/top2-scoring.yml` 只对手动触发，不设定时。它读仓库根目录的 `top2_stocks.txt`（每日个股报告近 5 个报告日、每天前 2 名去重后的清单，由 Top2 评分空间每日滚动更新），用 `python main.py --stocks <清单> --no-market-review` 专门评分，默认只评个股、不重复出大盘复盘；报告重命名为 `reports/top2_YYYYMMDD.md` 后提交，不覆盖当天日报、不读 `stocks.txt`。触发步骤：打开 `Actions → Top2 评分分析 → Run workflow`，`mode` 默认 `stocks-only`，点 `Run workflow`。与日报共用 `stock-analysis` 并发组，两边同时触发时按顺序排队，不会同时往仓库推。
 
 ### 本地定时任务
 
