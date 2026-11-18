@@ -1,0 +1,74 @@
+name: Hithink smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Smoke test Hithink API
+        env:
+          HITHINK_FINANCE_API_KEY: ${{ secrets.HITHINK_FINANCE_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, time, urllib.request, urllib.error
+
+          BASE = "https://fuyao.aicubes.cn"
+          KEY = os.environ["HITHINK_FINANCE_API_KEY"]
+
+          CALLS = [
+              ("tickers-search", "/api/meta/tickers/search?q=600519&limit=1"),
+              ("snapshot", "/api/a-share/prices/snapshot?thscodes=600519.SH,000001.SZ"),
+              ("income-annual", "/api/a-share/financials/income-statements?thscode=600519.SH&period=annual&limit=2"),
+              ("balance-quarterly", "/api/a-share/financials/balance-sheets?thscode=600519.SH&period=quarterly&limit=2"),
+              ("limit-up-stats-1117", "/api/a-share/special-data/limit-up-statistics?date=2026-11-17"),
+          ]
+
+          results = {}
+          all_ok = True
+          for name, path in CALLS:
+              req = urllib.request.Request(BASE + path, headers={"X-api-key": KEY})
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      status = resp.status
+                      body = resp.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e:
+                  status = e.code
+                  body = e.read().decode("utf-8", "replace")
+              except Exception as e:
+                  status = 0
+                  body = json.dumps({"error": str(e)})
+              ms = int((time.time() - t0) * 1000)
+              try:
+                  payload = json.loads(body)
+                  code = payload.get("code")
+                  data = payload.get("data")
+              except Exception:
+                  code, data = None, None
+              ok = (status == 200 and code == 0)
+              all_ok = all_ok and ok
+              sample = json.dumps(data, ensure_ascii=False)[:600] if data is not None else body[:300]
+              print(f"[{name}] http={status} code={code} {ms}ms ok={ok}")
+              print(f"  sample: {sample}")
+              results[name] = {"http": status, "code": code, "ms": ms, "ok": ok, "sample": sample}
+
+          print("OVERALL:", "PASS" if all_ok else "FAIL")
+          with open("hithink-smoke-result.json", "w", encoding="utf-8") as f:
+              json.dump(results, f, ensure_ascii=False, indent=2)
+          raise SystemExit(0 if all_ok else 1)
+          PYEOF
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hithink-smoke-result
+          path: hithink-smoke-result.json
+          retention-days: 7
