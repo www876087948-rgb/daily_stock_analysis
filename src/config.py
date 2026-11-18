@@ -987,6 +987,8 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    hithink_finance_api_key: Optional[str] = None
+    hithink_priority: int = 6
     tickflow_api_key: Optional[str] = None
     tickflow_kline_adjust: str = "none"
     tickflow_priority: int = 2
@@ -1920,6 +1922,8 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            hithink_finance_api_key=os.getenv('HITHINK_FINANCE_API_KEY') or None,
+            hithink_priority=parse_env_int(os.getenv('HITHINK_PRIORITY'), 6, field_name='HITHINK_PRIORITY', minimum=0),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
