@@ -883,6 +883,10 @@ schedule:
 3. 若当天是非交易日且希望仍执行，将 `force_run` 设为 `true`
 4. 点击 `Run workflow`
 
+#### Top2 评分手动运行
+
+`.github/workflows/top2-scoring.yml` 只对手动触发，不设定时。它读仓库根目录的 `top2_stocks.txt`（每日个股报告近 5 个报告日、每天前 2 名去重后的清单，由 Top2 评分空间每日滚动更新），用 `python main.py --stocks <清单> --no-market-review` 专门评分，默认只评个股、不重复出大盘复盘；报告重命名为 `reports/top2_YYYYMMDD.md` 后提交，不覆盖当天日报、不读 `stocks.txt`。触发步骤：打开 `Actions → Top2 评分分析 → Run workflow`，`mode` 默认 `stocks-only`，点 `Run workflow`。与日报共用 `stock-analysis` 并发组，两边同时触发时按顺序排队，不会同时往仓库推。
+
 ### 本地定时任务
 
 内建的定时任务调度器支持每天在指定时间（默认 18:00）运行分析。

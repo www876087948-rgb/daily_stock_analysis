@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Agent 轨迹评估增加独立股票范围诊断与干扰股票样例，区分越界请求、运行时拦截和无法判定调用，支持多股对比及阶段明细，不改变原指标或退出码。
 - [新功能] 市场宽度统计新增腾讯兜底：东财与 Tushare 均不可用时，TencentFetcher 以新浪行情中心全市场代码清单（Baostock/Tushare 兜底，不走东财）分批拉取腾讯行情，按 A 股涨跌停规则计算涨跌家数、涨跌停与总成交额；覆盖率低于 80% 或连续 3 批失败时返回空结果继续降级。涨跌统计的计算逻辑抽为 data_provider.base.calc_market_stats_from_quotes 共享实现，Akshare/Efinance/Tushare 三处同名方法改为委托调用，行为不变；概念/板块排行与筹码分布不在腾讯覆盖内。
 
+- [新功能] Top2 评分：每日个股报告近 5 个报告日每天前 2 名（分数优先，并列按当日成交额）去重后写入 top2_stocks.txt，新增 .github/workflows/top2-scoring.yml 手动触发专门评分（默认仅个股、不重复出大盘复盘），报告存为 reports/top2_YYYYMMDD.md，不读 stocks.txt、不碰日报流程。
+
 ## [3.33.0] - 2026-10-15
 
 ### 发布亮点
