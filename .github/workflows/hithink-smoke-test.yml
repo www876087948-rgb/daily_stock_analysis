@@ -91,9 +91,25 @@ jobs:
           adapter = HithinkFundamentalAdapter()
           bundle = adapter.get_fundamental_bundle("600519")
           print("BUNDLE_STATUS:", bundle.get("status"))
+          print("BUNDLE_ERRORS:", bundle.get("errors"))
           print("GROWTH:", bundle.get("growth"))
           print("FINANCIAL_REPORT:", (bundle.get("earnings") or {}).get("financial_report"))
           print("DIVIDEND:", (bundle.get("earnings") or {}).get("dividend"))
+          # Raw probe: what does the income endpoint actually return?
+          from data_provider.hithink_client import HithinkClient
+          raw = HithinkClient().get(
+              "/api/a-share/financials/income-statements",
+              {"thscode": "600519.SH", "period": "quarterly", "limit": 1},
+          )
+          print("RAW_INCOME_TYPE:", type(raw).__name__)
+          if isinstance(raw, dict):
+              print("RAW_INCOME_KEYS:", sorted(raw.keys()))
+              items = raw.get("item") or []
+              print("RAW_INCOME_ITEM_COUNT:", len(items))
+              if items and isinstance(items[0], dict):
+                  row = items[0]
+                  print("RAW_INCOME_ROW_KEYS:", sorted(row.keys()))
+                  print("RAW_INCOME_ROW:", {k: row.get(k) for k in ("fiscal_year", "fiscal_period", "report_date_ms", "operating_income", "parent_holder_net_profit", "basic_eps")})
           assert bundle.get("status") == "partial", "bundle not partial"
           report = (bundle.get("earnings") or {}).get("financial_report") or {}
           assert report.get("revenue"), "revenue missing"
